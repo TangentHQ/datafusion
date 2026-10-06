@@ -1557,7 +1557,7 @@ pub struct PhysicalExprNode {
     pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 29"
     )]
     pub expr_type: ::core::option::Option<physical_expr_node::ExprType>,
 }
@@ -1622,7 +1622,19 @@ pub mod physical_expr_node {
         LambdaVariable(super::PhysicalLambdaVariableExprNode),
         #[prost(message, tag = "27")]
         RangeExpr(super::PhysicalRangeExprNode),
+        #[prost(message, tag = "29")]
+        LiteralWithMetadata(super::PhysicalLiteralNode),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PhysicalLiteralNode {
+    #[prost(message, optional, tag = "1")]
+    pub value: ::core::option::Option<super::datafusion_common::ScalarValue>,
+    #[prost(map = "string, string", tag = "2")]
+    pub metadata: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalDynamicFilterNode {
