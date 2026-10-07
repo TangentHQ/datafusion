@@ -376,6 +376,10 @@ pub trait GroupsAccumulator: Send + std::any::Any {
     ///
     /// The default does nothing.
     fn shrink_to_fit(&mut self) {}
+
+    /// Reserves row-addressed state for `capacity` groups where supported.
+    /// This hint must not change the logical number of groups.
+    fn reserve_groups(&mut self, _capacity: usize) {}
 }
 
 #[cfg(test)]

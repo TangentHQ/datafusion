@@ -421,6 +421,27 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     fn take_state_batch_inner(
         &mut self,
         keep_capacity: bool,
+
+        self.take_state_batch_with_capacity(0)
+    }
+
+    /// Reserves fixed row capacity without changing the number of groups.
+    pub(in crate::aggregates) fn reserve_groups(&mut self, capacity: usize) {
+        let state = self.state.building_mut();
+        state.group_values.reserve_groups(capacity);
+        state
+            .batch_group_indices
+            .reserve_exact(capacity.saturating_sub(state.batch_group_indices.len()));
+        for acc in &mut state.accumulators {
+            acc.accumulator.reserve_groups(capacity);
+        }
+    }
+
+    /// Emits all states and optionally reserves a fixed capacity for the next table.
+    /// A zero capacity uses the normal memory-releasing path.
+    pub(in crate::aggregates) fn take_state_batch_with_capacity(
+        &mut self,
+        capacity: usize,
     ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
         let accumulator_metrics = Arc::clone(&self.aggregate_accumulator_metrics);
@@ -431,7 +452,11 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         }
 
         let output = group_by_metrics.time_emitting(|| {
-            let mut output = state.group_values.emit(EmitTo::All)?;
+            let mut output = if capacity > 0 {
+                state.group_values.emit_with_capacity(capacity)?
+            } else {
+                state.group_values.emit(EmitTo::All)?
+            };
             for (idx, acc) in state.accumulators.iter_mut().enumerate() {
                 output.extend(accumulator_metrics.time(
                     idx,
@@ -457,6 +482,16 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         if !keep_capacity {
             for acc in &mut state.accumulators {
                 acc.shrink_to_fit();
+
+        // key/index buffers too so the memory reservation can be released
+        // before the batch is sorted for spilling.
+        state.batch_group_indices.clear();
+        if capacity == 0 {
+            state.group_values.clear_shrink(0);
+            state.batch_group_indices.shrink_to_fit();
+        } else {
+            for acc in &mut state.accumulators {
+                acc.accumulator.reserve_groups(capacity);
             }
         }
 
