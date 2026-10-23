@@ -134,6 +134,13 @@ impl LimitedBatchCoalescer {
         Ok(())
     }
 
+    /// Complete a partial batch without closing the input. Used at a network
+    /// boundary when a consumer is waiting and the producer is blocked on I/O.
+    pub(crate) fn flush(&mut self) -> Result<()> {
+        self.inner.finish_buffered_batch()?;
+        Ok(())
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
     }

@@ -66,17 +66,17 @@ arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-datafusion-common = { workspace = true }
-datafusion-common-runtime = { workspace = true, default-features = true }
-datafusion-execution = { workspace = true }
-datafusion-expr = { workspace = true }
-datafusion-functions = { workspace = true }
-datafusion-functions-aggregate-common = { workspace = true }
-datafusion-functions-window-common = { workspace = true }
-datafusion-physical-expr = { workspace = true, default-features = true }
-datafusion-physical-expr-common = { workspace = true }
-datafusion-proto-common = { workspace = true, optional = true }
-datafusion-proto-models = { workspace = true, optional = true }
+datafusion-common = { version = "55.2.0", default-features = false }
+datafusion-common-runtime = { version = "55.2.0", default-features = true }
+datafusion-execution = { version = "55.2.0", default-features = false }
+datafusion-expr = { version = "55.2.0", default-features = false }
+datafusion-functions = { version = "55.2.0" }
+datafusion-functions-aggregate-common = { version = "55.2.0" }
+datafusion-functions-window-common = { version = "55.2.0" }
+datafusion-physical-expr = { version = "55.2.0", default-features = true }
+datafusion-physical-expr-common = { version = "55.2.0", default-features = false }
+datafusion-proto-common = { version = "55.2.0", optional = true }
+datafusion-proto-models = { version = "55.2.0", optional = true }
 futures = { workspace = true }
 half = { workspace = true }
 hashbrown = { workspace = true }
@@ -93,8 +93,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 arrow-data = { workspace = true }
 criterion = { workspace = true, features = ["async_futures"] }
-datafusion-functions-aggregate = { workspace = true }
-datafusion-functions-window = { workspace = true }
+datafusion-functions-aggregate = { version = "55.2.0" }
+datafusion-functions-window = { version = "55.2.0" }
 insta = { workspace = true }
 rand = { workspace = true }
 rstest = { workspace = true }
