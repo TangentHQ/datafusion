@@ -9,7 +9,7 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
 use std::vec;
 
@@ -73,6 +73,12 @@ use futures::stream::Stream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use log::trace;
 use parking_lot::Mutex;
+use tokio::sync::Notify;
+
+/// Opt in to flushing finite unordered repartition residuals when downstream
+/// is waiting and upstream is blocked. Dense ready input keeps normal batching.
+#[derive(Debug)]
+pub struct FlushOnDemand;
 
 mod distributor_channels;
 mod range;
@@ -200,6 +206,15 @@ impl PartitionSpillWriters {
 }
 
 impl OutputChannel {
+    async fn flush_requested(&mut self) -> Result<()> {
+        let Some(shared) = &self.shared_coalescer else {
+            return Ok(());
+        };
+        for batch in shared.flush_requested()? {
+            let _ = self.send(batch).await;
+        }
+        Ok(())
+    }
     /// Appends the batches that are ready to send to `out`.
     fn coalesce(&mut self, batch: RecordBatch, out: &mut Vec<RecordBatch>) -> Result<()> {
         match &self.shared_coalescer {
@@ -264,6 +279,8 @@ impl OutputChannel {
 struct SharedCoalescer {
     inner: Arc<Mutex<LimitedBatchCoalescer>>,
     active_senders: Arc<AtomicUsize>,
+    demand: Option<Arc<Notify>>,
+    requested: Arc<AtomicBool>,
 }
 
 impl SharedCoalescer {
@@ -275,6 +292,8 @@ impl SharedCoalescer {
                 None,
             ))),
             active_senders: Arc::new(AtomicUsize::new(num_senders)),
+            demand: None,
+            requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -290,7 +309,28 @@ impl SharedCoalescer {
         while let Some(b) = c.next_completed_batch() {
             out.push(b);
         }
+        if self.requested.load(AtomicOrdering::Acquire) {
+            if let Some(notify) = &self.demand {
+                notify.notify_one();
+            }
+        }
         Ok(())
+    }
+
+    fn request(&self) {
+        if let Some(notify) = &self.demand {
+            self.requested.store(true, AtomicOrdering::Release);
+            notify.notify_one();
+        }
+    }
+
+    fn flush_requested(&self) -> Result<Vec<RecordBatch>> {
+        let mut c = self.inner.lock();
+        if c.is_empty() || !self.requested.swap(false, AtomicOrdering::AcqRel) {
+            return Ok(vec![]);
+        }
+        c.flush()?;
+        Ok(std::iter::from_fn(|| c.next_completed_batch()).collect())
     }
 
     /// Decrement the active-senders counter. If this caller was the last
@@ -465,6 +505,10 @@ impl RepartitionExecState {
         let num_input_partitions = streams_and_metrics.len();
         let num_output_partitions = partitioning.partition_count();
         let coalesce_batches = !preserve_order && !input.boundedness().is_unbounded();
+        let demand = context
+            .session_config()
+            .get_extension::<FlushOnDemand>()
+            .map(|_| Arc::new(Notify::new()));
 
         let spill_manager = Arc::new(spill_manager);
 
@@ -537,11 +581,13 @@ impl RepartitionExecState {
             // handles batching, and for unbounded inputs, where a residual
             // batch could otherwise be withheld indefinitely.
             let shared_coalescer = coalesce_batches.then(|| {
-                SharedCoalescer::new(
+                let mut coalescer = SharedCoalescer::new(
                     input.schema(),
                     coalescer_batch_size,
                     num_input_partitions,
-                )
+                );
+                coalescer.demand = demand.clone();
+                coalescer
             });
 
             channels.insert(
@@ -1786,7 +1832,7 @@ impl ExecutionPlan for RepartitionExec {
 
         let stream = futures::stream::once(async move {
             // lock scope
-            let (rx, reservation, spill_readers, abort_helper) = {
+            let (rx, reservation, spill_readers, abort_helper, coalescer) = {
                 // lock mutexes
                 let mut state = state.lock();
                 let state = state.consume_input_streams(
@@ -1806,6 +1852,7 @@ impl ExecutionPlan for RepartitionExec {
                     rx,
                     reservation,
                     spill_readers,
+                    shared_coalescer,
                     ..
                 } = state
                     .channels
@@ -1817,6 +1864,7 @@ impl ExecutionPlan for RepartitionExec {
                     reservation,
                     spill_readers,
                     Arc::clone(&state.abort_helper),
+                    shared_coalescer,
                 )
             };
 
@@ -1874,7 +1922,7 @@ impl ExecutionPlan for RepartitionExec {
                     .next()
                     .expect("at least one spill reader should exist");
 
-                Ok(Box::pin(PerPartitionStream::new(
+                let mut stream = PerPartitionStream::new(
                     schema_captured,
                     rx.into_iter()
                         .next()
@@ -1884,7 +1932,9 @@ impl ExecutionPlan for RepartitionExec {
                     spill_stream,
                     num_input_partitions,
                     Some(BaselineMetrics::new(&metrics, partition)),
-                )) as SendableRecordBatchStream)
+                );
+                stream.coalescer = coalescer;
+                Ok(Box::pin(stream) as SendableRecordBatchStream)
             }
         })
         .try_flatten();
@@ -2310,10 +2360,27 @@ impl RepartitionExec {
         // While there are still outputs to send to, keep pulling inputs
         let mut batches_until_yield = partitioner.num_partitions();
         let mut coalesced = Vec::new();
+        let demand = output_channels
+            .values()
+            .find_map(|channel| channel.shared_coalescer.as_ref()?.demand.clone());
         while !output_channels.is_empty() {
             // fetch the next batch
             let timer = metrics.fetch_time.timer();
-            let result = stream.next().await;
+            let result = if let Some(demand) = &demand {
+                loop {
+                    tokio::select! {
+                        biased;
+                        batch = stream.next() => break batch,
+                        _ = demand.notified() => {
+                            for channel in output_channels.values_mut() {
+                                channel.flush_requested().await?;
+                            }
+                        }
+                    }
+                }
+            } else {
+                stream.next().await
+            };
             timer.done();
 
             // Input is done
@@ -2509,6 +2576,7 @@ struct PerPartitionStream {
 
     /// Execution metrics (None in preserve-order mode where StreamingMerge owns the metrics)
     baseline_metrics: Option<BaselineMetrics>,
+    coalescer: Option<SharedCoalescer>,
 }
 
 impl PerPartitionStream {
@@ -2530,6 +2598,7 @@ impl PerPartitionStream {
             state: StreamState::ReadingMemory,
             remaining_partitions: num_input_partitions,
             baseline_metrics,
+            coalescer: None,
         }
     }
 
@@ -2551,6 +2620,9 @@ impl PerPartitionStream {
                     let value = match self.receiver.recv().poll_unpin(cx) {
                         Poll::Ready(v) => v,
                         Poll::Pending => {
+                            if let Some(coalescer) = &self.coalescer {
+                                coalescer.request();
+                            }
                             // Nothing from channel, wait
                             return Poll::Pending;
                         }
@@ -3868,6 +3940,109 @@ mod tests {
                 inner: Arc::new(self.clone()),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn demand_flush_emits_finite_residual_before_input_finishes() -> Result<()> {
+        let schema = test_schema(false);
+        let batch = create_batch();
+        // The finite source emits one batch then blocks. Reaching this result
+        // must not depend on filling a target batch or observing input EOF.
+        let source = Arc::new(StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UnboundedTestPartition {
+                schema: Arc::clone(&schema),
+                batch: batch.clone(),
+            })],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(1))?;
+        let config = SessionConfig::new()
+            .with_batch_size(batch.num_rows() * 8)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut stream = exec.execute(0, task)?;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("demand flush deadlocked")
+                .expect("missing batch")?;
+        assert_eq!(result, batch);
+        drop(stream);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn demand_flush_preserves_dense_batching() -> Result<()> {
+        let schema = test_schema(false);
+        let partitions = vec![create_vec_batches(50)];
+        let source =
+            TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(1))?;
+        let config = SessionConfig::new()
+            .with_batch_size(200)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let batches: Vec<_> = exec.execute(0, task)?.try_collect().await?;
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            vec![200, 200]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn demand_flush_wakes_late_consumers_and_finishes_after_empty_batches()
+    -> Result<()> {
+        let schema = test_schema(false);
+        let batch = create_batch();
+        let first = batch.slice(0, 1);
+        let second = batch.slice(1, 2);
+        let source = Arc::new(
+            BarrierExec::new(
+                vec![vec![
+                    batch.slice(0, 0),
+                    first.clone(),
+                    second.clone(),
+                    batch.slice(0, 0),
+                ]],
+                Arc::clone(&schema),
+            )
+            .without_start_barrier()
+            .with_finish_barrier()
+            .with_log(false),
+        );
+        let exec =
+            RepartitionExec::try_new(source.clone(), Partitioning::RoundRobinBatch(2))?;
+        let config = SessionConfig::new()
+            .with_batch_size(200)
+            .with_extension(Arc::new(FlushOnDemand));
+        let task = Arc::new(TaskContext::default().with_session_config(config));
+        let mut stream = exec.execute(0, Arc::clone(&task))?;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .expect("first consumer deadlocked")
+                .expect("missing first batch")?;
+        assert_eq!(result, first);
+        // The producer is already waiting for EOF. Starting another consumer
+        // must wake it to flush data which arrived before this demand.
+        let mut late = exec.execute(1, task)?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), late.next())
+            .await
+            .expect("late consumer deadlocked")
+            .expect("missing late batch")?;
+        assert_eq!(result, second);
+        drop(stream);
+        source.wait_finish().await;
+        assert!(late.next().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
