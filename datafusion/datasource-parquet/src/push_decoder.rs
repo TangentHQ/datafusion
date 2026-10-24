@@ -249,6 +249,8 @@ impl RowGroupPruner {
 pub(crate) struct PushDecoderStreamState {
     pub(crate) factory: Arc<dyn crate::ParquetFileReaderFactory>,
     pub(crate) metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+    pub(crate) decode_projection: parquet::arrow::ProjectionMask,
+    pub(crate) decode_schema: arrow::datatypes::SchemaRef,
     pub(crate) batch_size: usize,
     pub(crate) memory: Option<Arc<dyn crate::ParquetBatchMemory>>,
     pub(crate) admitted: bool,
@@ -406,10 +408,13 @@ impl PushDecoderStreamState {
             if !self.admitted {
                 let groups: Vec<_> =
                     self.rg_plan.iter().map(|entry| entry.rg_index).collect();
-                match self
-                    .factory
-                    .reserve(&self.metadata, &groups, self.batch_size)
-                {
+                match self.factory.reserve(
+                    &self.metadata,
+                    &groups,
+                    &self.decode_projection,
+                    &self.decode_schema,
+                    self.batch_size,
+                ) {
                     Ok(memory) => {
                         self.memory = memory;
                         self.admitted = true;

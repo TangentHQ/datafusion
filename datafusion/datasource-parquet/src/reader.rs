@@ -55,6 +55,8 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         &self,
         _metadata: &ParquetMetaData,
         _row_groups: &[usize],
+        _projection: &parquet::arrow::ProjectionMask,
+        _schema: &arrow::datatypes::Schema,
         _batch_size: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ParquetBatchMemory>>> {
         Ok(None)

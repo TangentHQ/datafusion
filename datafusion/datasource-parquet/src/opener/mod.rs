@@ -1435,6 +1435,7 @@ impl RowGroupsPrunedParquetOpen {
             prepared.virtual_state.as_deref(),
         )?;
 
+        let mut decode_projection = decoder_projection.projection_mask().clone();
         let (decoder, rg_plan, has_row_selection) = {
             let pushdown_predicate = prepared
                 .pushdown_filters
@@ -1486,6 +1487,9 @@ impl RowGroupsPrunedParquetOpen {
             let mut builder =
                 decoder_config.build(prepared_access_plan, reader_metadata.clone());
             if let Some(row_filter) = row_filter_generator.next_filter() {
+                for predicate in row_filter.predicates() {
+                    decode_projection.union(predicate.projection());
+                }
                 builder = builder.with_row_filter(row_filter);
                 if let Some(max_predicate_cache_size) = prepared.max_predicate_cache_size
                 {
@@ -1548,6 +1552,8 @@ impl RowGroupsPrunedParquetOpen {
         let stream = PushDecoderStreamState {
             factory: Arc::clone(&prepared.parquet_file_reader_factory),
             metadata: Arc::clone(&file_metadata),
+            decode_projection,
+            decode_schema: Arc::clone(&prepared.physical_file_schema),
             batch_size: prepared.batch_size,
             memory: None,
             admitted: false,
