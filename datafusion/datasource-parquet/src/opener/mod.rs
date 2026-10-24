@@ -1447,6 +1447,8 @@ impl RowGroupsPrunedParquetOpen {
                 file_metadata.as_ref(),
                 prepared.reorder_predicates,
                 &prepared.file_metrics,
+                &prepared.parquet_file_reader_factory,
+                decoder_projection.projection_mask(),
             );
 
             // Build the prepared access plan first — `prepare_access_plan` may

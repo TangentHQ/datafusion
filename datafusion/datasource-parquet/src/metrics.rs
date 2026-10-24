@@ -69,6 +69,8 @@ pub struct ParquetFileMetrics {
     pub pushdown_rows_matched: Count,
     /// Total time spent evaluating row-level pushdown filters
     pub row_pushdown_eval_time: Time,
+    /// Rows whose optional decoder runtime predicate was bypassed by host cost policy.
+    pub runtime_filter_bypassed_rows: Count,
     /// Total time spent evaluating row group-level statistics filters
     pub statistics_eval_time: Time,
     /// Total time spent evaluating row group Bloom Filters
@@ -179,6 +181,9 @@ impl ParquetFileMetrics {
             .with_category(MetricCategory::Rows)
             .counter("pushdown_rows_matched", partition);
 
+        let runtime_filter_bypassed_rows = builder
+            .clone()
+            .counter("runtime_filter_bypassed_rows", partition);
         let row_pushdown_eval_time = builder
             .clone()
             .subset_time("row_pushdown_eval_time", partition);
@@ -221,6 +226,7 @@ impl ParquetFileMetrics {
             pushdown_rows_pruned,
             pushdown_rows_matched,
             row_pushdown_eval_time,
+            runtime_filter_bypassed_rows,
             page_index_rows_pruned,
             page_index_pages_pruned,
             statistics_eval_time,

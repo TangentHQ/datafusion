@@ -65,7 +65,11 @@
 //! - `WHERE s['value'] > 5` — pushed down (accesses a primitive leaf)
 //! - `WHERE s IS NOT NULL`  — not pushed down (references the whole struct)
 
-use std::sync::Arc;
+use crate::{
+    ParquetFileReaderFactory, ParquetRuntimeFilter, ParquetRuntimeFilterMetrics,
+};
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
+use std::{sync::Arc, time::Instant};
 
 use arrow::array::BooleanArray;
 use arrow::datatypes::{Schema, SchemaRef};
@@ -117,6 +121,55 @@ pub(crate) struct DatafusionArrowPredicate {
     rows_matched: metrics::Count,
     /// how long was spent evaluating this predicate
     time: metrics::Time,
+    runtime: Option<Box<Runtime>>,
+}
+
+#[derive(Debug)]
+struct Runtime {
+    policy: Arc<dyn ParquetRuntimeFilter>,
+    observation: ParquetRuntimeFilterMetrics,
+    generation: u64,
+    bypassed: metrics::Count,
+}
+
+impl Runtime {
+    fn new(
+        policy: Arc<dyn ParquetRuntimeFilter>,
+        metadata: &ParquetMetaData,
+        mask: &ProjectionMask,
+        output: &ProjectionMask,
+        bypassed: metrics::Count,
+    ) -> Self {
+        let mut observation = ParquetRuntimeFilterMetrics {
+            total_rows: usize::try_from(metadata.file_metadata().num_rows())
+                .unwrap_or(usize::MAX),
+            predicate_columns: (0..metadata.file_metadata().schema_descr().num_columns())
+                .filter(|index| mask.leaf_included(*index))
+                .count(),
+            ..Default::default()
+        };
+        for group in metadata.row_groups() {
+            for (index, column) in group.columns().iter().enumerate() {
+                let bytes = usize::try_from(column.uncompressed_size()).unwrap_or(0);
+                if mask.leaf_included(index) {
+                    observation.predicate_decode_bytes =
+                        observation.predicate_decode_bytes.saturating_add(bytes);
+                } else if output.leaf_included(index) {
+                    observation.output_decode_bytes =
+                        observation.output_decode_bytes.saturating_add(bytes);
+                    observation.output_bytes = observation.output_bytes.saturating_add(
+                        usize::try_from(column.compressed_size()).unwrap_or(0),
+                    );
+                }
+            }
+        }
+        Self {
+            policy,
+            observation,
+            generation: 0,
+            bypassed,
+        }
+    }
 }
 
 impl DatafusionArrowPredicate {
@@ -136,11 +189,30 @@ impl DatafusionArrowPredicate {
             rows_pruned,
             rows_matched,
             time,
+            runtime: None,
         })
     }
 }
 
 impl ArrowPredicate for DatafusionArrowPredicate {
+    fn should_evaluate(&mut self, rows: usize) -> bool {
+        let Some(runtime) = &mut self.runtime else {
+            return true;
+        };
+        let generation = self.physical_expr.snapshot_generation();
+        if generation != runtime.generation {
+            runtime.observation.rows = 0;
+            runtime.observation.pruned = 0;
+            runtime.observation.nanos = 0;
+            runtime.generation = generation;
+        }
+        runtime.observation.row_group_rows = rows;
+        let enabled = runtime.policy.enabled(&runtime.observation);
+        if !enabled {
+            runtime.bypassed.add(rows);
+        }
+        enabled
+    }
     fn projection(&self) -> &ProjectionMask {
         &self.projection_mask
     }
@@ -148,6 +220,7 @@ impl ArrowPredicate for DatafusionArrowPredicate {
     fn evaluate(&mut self, batch: RecordBatch) -> ArrowResult<BooleanArray> {
         // scoped timer updates on drop
         let mut timer = self.time.timer();
+        let started = self.runtime.as_ref().map(|_| Instant::now());
 
         self.physical_expr
             .evaluate(&batch)
@@ -159,6 +232,15 @@ impl ArrowPredicate for DatafusionArrowPredicate {
                 self.rows_pruned.add(num_pruned);
                 self.rows_matched.add(num_matched);
                 timer.stop();
+                if let (Some(started), Some(runtime)) = (started, &mut self.runtime) {
+                    runtime.observation.rows =
+                        runtime.observation.rows.saturating_add(bool_arr.len());
+                    runtime.observation.pruned =
+                        runtime.observation.pruned.saturating_add(num_pruned);
+                    runtime.observation.nanos = runtime.observation.nanos.saturating_add(
+                        started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    );
+                }
                 Ok(bool_arr)
             })
             .map_err(|e| {
@@ -302,6 +384,7 @@ pub(crate) fn build_parquet_read_plan(
 /// use datafusion_common::ScalarValue;
 /// use arrow::datatypes::{DataType, Field, Schema};
 /// use std::sync::Arc;
+
 ///
 /// let schema = Arc::new(Schema::new(vec![
 ///     Field::new("age", DataType::Int32, false),
@@ -401,6 +484,24 @@ pub fn build_row_filter(
     reorder_predicates: bool,
     file_metrics: &ParquetFileMetrics,
 ) -> Result<Option<RowFilter>> {
+    build_row_filter_with_runtime(
+        expr,
+        file_schema,
+        metadata,
+        reorder_predicates,
+        file_metrics,
+        None,
+    )
+}
+
+fn build_row_filter_with_runtime(
+    expr: &Arc<dyn PhysicalExpr>,
+    file_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    reorder_predicates: bool,
+    file_metrics: &ParquetFileMetrics,
+    runtime: Option<(&Arc<dyn ParquetFileReaderFactory>, &ProjectionMask)>,
+) -> Result<Option<RowFilter>> {
     let rows_pruned = &file_metrics.pushdown_rows_pruned;
     let rows_matched = &file_metrics.pushdown_rows_matched;
     let time = &file_metrics.row_pushdown_eval_time;
@@ -452,13 +553,37 @@ pub fn build_row_filter(
                 metrics::Count::new()
             };
 
-            DatafusionArrowPredicate::try_new(
+            // Only a whole dynamic conjunct is optional. Never classify a
+            // mixed SQL expression merely because it contains a dynamic child.
+            let runtime = if candidate
+                .expr
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .is_some()
+            {
+                if let Some((factory, projection)) = runtime {
+                    factory.runtime_filter()?.map(|policy| {
+                        Runtime::new(
+                            policy,
+                            metadata,
+                            &candidate.read_plan.projection_mask,
+                            projection,
+                            file_metrics.runtime_filter_bypassed_rows.clone(),
+                        )
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut predicate = DatafusionArrowPredicate::try_new(
                 candidate,
                 predicate_rows_pruned,
                 predicate_rows_matched,
                 time.clone(),
-            )
-            .map(|pred| Box::new(pred) as _)
+            )?;
+            predicate.runtime = runtime.map(Box::new);
+            Ok(Box::new(predicate) as _)
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|filters| Some(RowFilter::new(filters)))
@@ -476,6 +601,7 @@ pub(crate) struct RowFilterGenerator<'a> {
     reorder_predicates: bool,
     file_metrics: &'a ParquetFileMetrics,
     first_row_filter: Option<RowFilter>,
+    runtime: Option<(&'a Arc<dyn ParquetFileReaderFactory>, &'a ProjectionMask)>,
 }
 
 impl<'a> RowFilterGenerator<'a> {
@@ -485,6 +611,8 @@ impl<'a> RowFilterGenerator<'a> {
         file_metadata: &'a ParquetMetaData,
         reorder_predicates: bool,
         file_metrics: &'a ParquetFileMetrics,
+        factory: &'a Arc<dyn ParquetFileReaderFactory>,
+        projection: &'a ProjectionMask,
     ) -> Self {
         let mut generator = Self {
             predicate,
@@ -493,6 +621,7 @@ impl<'a> RowFilterGenerator<'a> {
             reorder_predicates,
             file_metrics,
             first_row_filter: None,
+            runtime: Some((factory, projection)),
         };
         generator.first_row_filter = generator.build();
         generator
@@ -504,12 +633,13 @@ impl<'a> RowFilterGenerator<'a> {
 
     fn build(&self) -> Option<RowFilter> {
         let predicate = self.predicate?;
-        match build_row_filter(
+        match build_row_filter_with_runtime(
             predicate,
             self.physical_file_schema,
             self.file_metadata,
             self.reorder_predicates,
             self.file_metrics,
+            self.runtime,
         ) {
             Ok(Some(filter)) => Some(filter),
             Ok(None) => None,
