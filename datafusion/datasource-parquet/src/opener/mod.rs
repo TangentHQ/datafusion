@@ -1554,6 +1554,7 @@ impl RowGroupsPrunedParquetOpen {
             metadata: Arc::clone(&file_metadata),
             decode_projection,
             decode_schema: Arc::clone(&prepared.physical_file_schema),
+            decode_expressions: prepared.projection.clone(),
             batch_size: prepared.batch_size,
             memory: None,
             admitted: false,

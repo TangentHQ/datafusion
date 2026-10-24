@@ -251,6 +251,7 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) metadata: Arc<parquet::file::metadata::ParquetMetaData>,
     pub(crate) decode_projection: parquet::arrow::ProjectionMask,
     pub(crate) decode_schema: arrow::datatypes::SchemaRef,
+    pub(crate) decode_expressions: datafusion_physical_expr::projection::ProjectionExprs,
     pub(crate) batch_size: usize,
     pub(crate) memory: Option<Arc<dyn crate::ParquetBatchMemory>>,
     pub(crate) admitted: bool,
@@ -317,7 +318,11 @@ impl PushDecoderStreamState {
                             Some(memory) => memory.retain(batch),
                             None => Ok(batch),
                         }
-                        .and_then(|batch| self.project_batch(&batch));
+                        .and_then(|batch| self.project_batch(&batch))
+                        .and_then(|batch| match &self.memory {
+                            Some(memory) => memory.retain_projected(batch),
+                            None => Ok(batch),
+                        });
                         timer.stop();
                         drop(timer);
                         return Some((result, self));
@@ -413,6 +418,7 @@ impl PushDecoderStreamState {
                     &groups,
                     &self.decode_projection,
                     &self.decode_schema,
+                    &self.decode_expressions,
                     self.batch_size,
                 ) {
                     Ok(memory) => {

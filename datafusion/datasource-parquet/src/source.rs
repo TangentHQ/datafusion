@@ -701,6 +701,13 @@ impl FileSource for ParquetSource {
             expr_references_scalar_udf::<FileRowIndexFunc>(&projection_expr.expr)
         }) {
             source.projection = self.projection.try_merge(projection)?;
+            if source
+                .parquet_file_reader_factory
+                .as_ref()
+                .is_some_and(|factory| !factory.supports_projection(&source.projection))
+            {
+                return Ok(None);
+            }
             return Ok(Some(Arc::new(source)));
         }
 
@@ -715,6 +722,14 @@ impl FileSource for ParquetSource {
             projection,
             &row_index_col,
         )?;
+
+        if source
+            .parquet_file_reader_factory
+            .as_ref()
+            .is_some_and(|factory| !factory.supports_projection(&source.projection))
+        {
+            return Ok(None);
+        }
 
         Ok(Some(Arc::new(source)))
     }

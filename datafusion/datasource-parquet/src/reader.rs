@@ -47,6 +47,14 @@ use std::sync::Arc;
 ///
 /// See [`DefaultParquetFileReaderFactory`] for a simple implementation.
 pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
+    /// Decline projection expressions whose allocations the custom reader
+    /// cannot admit. They remain in DataFusion's ordinary ProjectionExec.
+    fn supports_projection(
+        &self,
+        _projection: &datafusion_physical_expr::projection::ProjectionExprs,
+    ) -> bool {
+        true
+    }
     /// Admit decoding before any row filter or row-group reader is polled.
     /// The decoder may skip empty groups internally, so the owner must cover
     /// the largest of the remaining groups, including predicate columns.
@@ -57,6 +65,7 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         _row_groups: &[usize],
         _projection: &parquet::arrow::ProjectionMask,
         _schema: &arrow::datatypes::Schema,
+        _expressions: &datafusion_physical_expr::projection::ProjectionExprs,
         _batch_size: usize,
     ) -> datafusion_common::Result<Option<Arc<dyn ParquetBatchMemory>>> {
         Ok(None)
@@ -92,6 +101,15 @@ pub trait ParquetBatchMemory: Debug + Send + Sync {
         &self,
         batch: arrow::array::RecordBatch,
     ) -> datafusion_common::Result<arrow::array::RecordBatch>;
+
+    /// Retain independently materialized projection values, if any. A custom
+    /// owner can leave already owned conversion arrays unchanged.
+    fn retain_projected(
+        &self,
+        batch: arrow::array::RecordBatch,
+    ) -> datafusion_common::Result<arrow::array::RecordBatch> {
+        Ok(batch)
+    }
 }
 
 /// Default implementation of [`ParquetFileReaderFactory`]
