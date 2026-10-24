@@ -613,6 +613,7 @@ impl ExecutionPlan for FilterExec {
                 .session_config()
                 .get_extension::<crate::repartition::FlushOnDemand>()
                 .is_some(),
+            waiting: false,
             input: self.input.execute(partition, context)?,
             metrics,
             projection: self.projection.clone(),
@@ -1223,6 +1224,8 @@ struct FilterExecStream {
     batch_coalescer: LimitedBatchCoalescer,
     /// Opt-in prompt output while the input is blocked on a transfer.
     flush: bool,
+    /// One immediate retry distinguishes a cooperative yield from blocked I/O.
+    waiting: bool,
 }
 
 /// The metrics for `FilterExec`
@@ -1301,11 +1304,19 @@ impl Stream for FilterExecStream {
 
             // Attempt to pull the next batch from the input stream.
             let next = match self.input.poll_next_unpin(cx) {
-                Poll::Ready(next) => next,
+                Poll::Ready(next) => {
+                    self.waiting = false;
+                    next
+                }
                 Poll::Pending => {
                     if self.flush && !self.batch_coalescer.is_empty() {
-                        self.batch_coalescer.flush()?;
-                        continue;
+                        if self.waiting {
+                            self.waiting = false;
+                            self.batch_coalescer.flush()?;
+                            continue;
+                        }
+                        self.waiting = true;
+                        cx.waker().wake_by_ref();
                     }
                     return Poll::Pending;
                 }

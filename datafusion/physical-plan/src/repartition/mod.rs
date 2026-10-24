@@ -89,8 +89,9 @@ use log::trace;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
-/// Opt in to flushing finite unordered repartition residuals when downstream
-/// is waiting and upstream is blocked. Dense ready input keeps normal batching.
+/// Opt in to flushing finite unordered repartition and filter residuals when
+/// downstream is waiting and upstream is blocked. Dense ready input keeps
+/// normal batching, including an immediate retry after cooperative yields.
 #[derive(Debug)]
 pub struct FlushOnDemand;
 
