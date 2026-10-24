@@ -47,6 +47,11 @@ use std::sync::Arc;
 ///
 /// See [`DefaultParquetFileReaderFactory`] for a simple implementation.
 pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
+    /// Optional fallible native page and selected-batch memory admission.
+    fn decoder_memory(&self) -> Option<Arc<dyn parquet::arrow::memory::DecoderMemory>> {
+        None
+    }
+
     /// Decline projection expressions whose allocations the custom reader
     /// cannot admit. They remain in DataFusion's ordinary ProjectionExec.
     fn supports_projection(
@@ -97,6 +102,12 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
 /// An admitted decoder owner. Retention runs before the native projection,
 /// so independently admitted conversion buffers need not be charged twice.
 pub trait ParquetBatchMemory: Debug + Send + Sync {
+    /// Admit independently materialized projection literals immediately before
+    /// their allocation, using the actual selected row count.
+    fn before_projection(&self, _rows: usize) -> datafusion_common::Result<()> {
+        Ok(())
+    }
+
     fn retain(
         &self,
         batch: arrow::array::RecordBatch,

@@ -324,7 +324,12 @@ impl PushDecoderStreamState {
                             Some(memory) => memory.retain(batch),
                             None => Ok(batch),
                         }
-                        .and_then(|batch| self.project_batch(&batch))
+                        .and_then(|batch| {
+                            if let Some(memory) = &self.memory {
+                                memory.before_projection(batch.num_rows())?;
+                            }
+                            self.project_batch(&batch)
+                        })
                         .and_then(|batch| match &self.memory {
                             Some(memory) => memory.retain_projected(batch),
                             None => Ok(batch),

@@ -1513,6 +1513,9 @@ impl RowGroupsPrunedParquetOpen {
                 }
             }
 
+            if let Some(memory) = prepared.parquet_file_reader_factory.decoder_memory() {
+                builder = builder.with_decoder_memory(memory);
+            }
             (builder.build()?, rg_plan, has_row_selection, batch_size)
         };
 
