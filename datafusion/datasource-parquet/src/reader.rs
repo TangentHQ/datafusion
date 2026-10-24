@@ -39,6 +39,37 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Bounded observations for one OPTIONAL runtime decoder predicate.
+#[derive(Debug, Default)]
+pub struct ParquetRuntimeFilterMetrics {
+    /// Rows evaluated in the current dynamic-filter generation.
+    pub rows: usize,
+    /// Evaluated rows rejected, including NULL results.
+    pub pruned: usize,
+    /// Elapsed expression evaluation nanoseconds.
+    pub nanos: u64,
+    /// File row count used to scale catalogue size estimates.
+    pub total_rows: usize,
+    /// Uncompressed predicate-column bytes in the file.
+    pub predicate_decode_bytes: usize,
+    /// Compressed output-column bytes excluding predicate columns.
+    pub output_bytes: usize,
+    /// Uncompressed output bytes excluding predicate columns.
+    pub output_decode_bytes: usize,
+    /// Rows in the next row group, before optional pruning.
+    pub row_group_rows: usize,
+    /// Number of predicate leaf columns.
+    pub predicate_columns: usize,
+}
+
+/// Host cost policy. Skipping only the decoder copy must preserve final native
+/// join/sort operators and mandatory predicates. Implementations own admission
+/// for retained feedback metadata, and never evaluate SQL independently.
+pub trait ParquetRuntimeFilter: Debug + Send + Sync {
+    /// Decide before fetching a row group. False skips only this optional decoder copy.
+    fn enabled(&self, metrics: &ParquetRuntimeFilterMetrics) -> bool;
+}
+
 /// Interface for reading Apache Parquet files.
 ///
 /// The combined implementations of [`ParquetFileReaderFactory`] and
@@ -47,6 +78,14 @@ use std::sync::Arc;
 ///
 /// See [`DefaultParquetFileReaderFactory`] for a simple implementation.
 pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
+    /// One separately admitted policy per optional runtime predicate. None
+    /// preserves stock decoder behavior; admission pressure may disable it.
+    fn runtime_filter(
+        &self,
+    ) -> datafusion_common::Result<Option<Arc<dyn ParquetRuntimeFilter>>> {
+        Ok(None)
+    }
+
     /// Optional fallible native page and selected-batch memory admission.
     fn decoder_memory(&self) -> Option<Arc<dyn parquet::arrow::memory::DecoderMemory>> {
         None
