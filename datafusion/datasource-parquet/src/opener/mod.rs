@@ -1467,7 +1467,9 @@ impl RowGroupsPrunedParquetOpen {
                 .max()
                 .unwrap_or(1);
             let rows = usize::try_from(rows).map_err(|_| {
-                DataFusionError::Execution("Invalid Parquet row-group length".into())
+                datafusion_common::DataFusionError::Execution(
+                    "Invalid Parquet row-group length".into(),
+                )
             })?;
             let batch_size = prepared.batch_size.min(rows.max(1));
             let decoder_config = DecoderBuilderConfig {
