@@ -19,7 +19,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
 use itertools::Itertools;
@@ -45,7 +45,7 @@ use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
 use crate::stream::EmptyRecordBatchStream;
 use crate::{ChildrenPropertiesMode, ReplaceChildrenOptions, validate_child_count};
 use crate::{
-    DisplayFormatType, ExecutionPlan,
+    DisplayFormatType, ExecutionPlan, SortOrderPushdownResult,
     metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RatioMetrics},
 };
 
@@ -68,8 +68,8 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{
-    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
-    conjunction, split_conjunction,
+    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr,
+    PhysicalSortExpr, analyze, conjunction, split_conjunction,
 };
 
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -609,6 +609,10 @@ impl ExecutionPlan for FilterExec {
         Ok(Box::pin(FilterExecStream {
             schema: self.schema(),
             predicate: Arc::clone(&self.predicate),
+            flush: context
+                .session_config()
+                .get_extension::<crate::repartition::FlushOnDemand>()
+                .is_some(),
             input: self.input.execute(partition, context)?,
             metrics,
             projection: self.projection.clone(),
@@ -817,6 +821,19 @@ impl ExecutionPlan for FilterExec {
 
     fn fetch(&self) -> Option<usize> {
         self.fetch
+    }
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // Filtering preserves relative row order. Leave projected filters to
+        // the existing projection optimizer rather than guessing index maps.
+        if self.projection.is_some() {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        self.input.try_pushdown_sort(order)?.try_map(|input| {
+            replace_children_if_necessary(Arc::new(self.clone()), vec![input])
+        })
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -1203,6 +1220,8 @@ struct FilterExecStream {
     projection: Option<ProjectionRef>,
     /// Batch coalescer to combine small batches
     batch_coalescer: LimitedBatchCoalescer,
+    /// Opt-in prompt output while the input is blocked on a transfer.
+    flush: bool,
 }
 
 /// The metrics for `FilterExec`
@@ -1280,7 +1299,17 @@ impl Stream for FilterExecStream {
             }
 
             // Attempt to pull the next batch from the input stream.
-            match ready!(self.input.poll_next_unpin(cx)) {
+            let next = match self.input.poll_next_unpin(cx) {
+                Poll::Ready(next) => next,
+                Poll::Pending => {
+                    if self.flush && !self.batch_coalescer.is_empty() {
+                        self.batch_coalescer.flush()?;
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+            };
+            match next {
                 None => {
                     self.batch_coalescer.finish()?;
                     // Release the input pipeline's resources.
