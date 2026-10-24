@@ -257,6 +257,10 @@ pub(crate) struct PushDecoderStreamState {
     pub(crate) admitted: bool,
     pub(crate) decoder: Option<ParquetPushDecoder>,
     pub(crate) active_reader: Option<ParquetRecordBatchReader>,
+    /// Conservative upper bound on rows left in the current reader. A native
+    /// predicate may silently skip earlier groups, so use the largest pending
+    /// group instead of assuming `rg_plan.front()` identifies the returned one.
+    pub(crate) reader_rows: usize,
     pub(crate) rg_plan: VecDeque<RgPlanEntry>,
     pub(crate) reader: Box<dyn AsyncFileReader>,
     /// Per-file projection: the mask installed on every decoder and the
@@ -312,6 +316,8 @@ impl PushDecoderStreamState {
             if let Some(reader) = self.active_reader.as_mut() {
                 match reader.next() {
                     Some(Ok(batch)) => {
+                        self.reader_rows =
+                            self.reader_rows.saturating_sub(batch.num_rows());
                         let mut timer = self.baseline_metrics.elapsed_compute().timer();
                         self.copy_arrow_reader_metrics();
                         let result = match &self.memory {
@@ -325,6 +331,14 @@ impl PushDecoderStreamState {
                         });
                         timer.stop();
                         drop(timer);
+                        if self.reader_rows == 0 {
+                            // Do not keep decoder scratch alive behind a queued
+                            // final batch while downstream applies backpressure.
+                            // The footer row bound proves this reader exhausted.
+                            self.active_reader = None;
+                            self.memory = None;
+                            self.admitted = false;
+                        }
                         return Some((result, self));
                     }
                     Some(Err(e)) => {
@@ -453,6 +467,21 @@ impl PushDecoderStreamState {
                     }
                 }
                 Ok(DecodeResult::Data(reader)) => {
+                    let rows = self.rg_plan.iter().try_fold(0, |rows, entry| {
+                        let count = usize::try_from(
+                            self.metadata.row_group(entry.rg_index).num_rows(),
+                        )
+                        .map_err(|_| {
+                            DataFusionError::Execution(
+                                "Invalid Parquet row-group length".into(),
+                            )
+                        })?;
+                        Ok::<_, DataFusionError>(rows.max(count))
+                    });
+                    self.reader_rows = match rows {
+                        Ok(rows) => rows,
+                        Err(error) => return Some((Err(error), self)),
+                    };
                     // Pop the RG this reader is for (we already filtered
                     // pruned ones in step 2, so `rg_plan.front()` is the RG
                     // the decoder is about to read).

@@ -1575,6 +1575,7 @@ impl RowGroupsPrunedParquetOpen {
             admitted: false,
             decoder: Some(decoder),
             active_reader: None,
+            reader_rows: 0,
             rg_plan,
             reader: prepared.async_file_reader,
             decoder_projection,
