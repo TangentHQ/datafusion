@@ -35,20 +35,20 @@ arrow = { workspace = true }
 arrow-schema = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-datafusion-common = { workspace = true, features = ["object_store", "parquet"] }
-datafusion-common-runtime = { workspace = true }
-datafusion-datasource = { workspace = true }
-datafusion-execution = { workspace = true }
-datafusion-expr = { workspace = true }
-datafusion-functions = { workspace = true }
-datafusion-functions-aggregate-common = { workspace = true }
-datafusion-physical-expr = { workspace = true }
-datafusion-physical-expr-adapter = { workspace = true }
-datafusion-physical-expr-common = { workspace = true }
-datafusion-physical-plan = { workspace = true }
-datafusion-proto-models = { workspace = true, optional = true }
-datafusion-pruning = { workspace = true }
-datafusion-session = { workspace = true }
+datafusion-common = { version = "55.2.0", default-features = false, features = ["object_store", "parquet"] }
+datafusion-common-runtime = { version = "55.2.0", default-features = true }
+datafusion-datasource = { version = "55.2.0", default-features = false }
+datafusion-execution = { version = "55.2.0", default-features = false }
+datafusion-expr = { version = "55.2.0", default-features = false }
+datafusion-functions = { version = "55.2.0", default-features = false }
+datafusion-functions-aggregate-common = { version = "55.2.0", default-features = false }
+datafusion-physical-expr = { version = "55.2.0", default-features = false }
+datafusion-physical-expr-adapter = { version = "55.2.0", default-features = false }
+datafusion-physical-expr-common = { version = "55.2.0", default-features = false }
+datafusion-physical-plan = { version = "55.2.0", default-features = true }
+datafusion-proto-models = { version = "55.2.0", default-features = false, optional = true }
+datafusion-pruning = { version = "55.2.0", default-features = false }
+datafusion-session = { version = "55.2.0", default-features = false }
 futures = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
@@ -60,8 +60,8 @@ tokio = { workspace = true }
 [dev-dependencies]
 chrono = { workspace = true }
 criterion = { workspace = true }
-datafusion-functions = { workspace = true }
-datafusion-functions-nested = { workspace = true }
+datafusion-functions = { version = "55.2.0", default-features = false }
+datafusion-functions-nested = { version = "55.2.0", default-features = false }
 tempfile = { workspace = true }
 
 # Note: add additional linter rules in lib.rs.

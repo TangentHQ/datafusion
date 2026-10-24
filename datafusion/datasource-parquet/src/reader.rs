@@ -47,6 +47,19 @@ use std::sync::Arc;
 ///
 /// See [`DefaultParquetFileReaderFactory`] for a simple implementation.
 pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
+    /// Admit decoding before any row filter or row-group reader is polled.
+    /// The decoder may skip empty groups internally, so the owner must cover
+    /// the largest of the remaining groups, including predicate columns.
+    /// It remains live through the reader and may be shared by returned arrays.
+    fn reserve(
+        &self,
+        _metadata: &ParquetMetaData,
+        _row_groups: &[usize],
+        _batch_size: usize,
+    ) -> datafusion_common::Result<Option<Arc<dyn ParquetBatchMemory>>> {
+        Ok(None)
+    }
+
     /// Provides an `AsyncFileReader` for reading data from a parquet file specified
     ///
     /// # Notes
@@ -68,6 +81,15 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
+}
+
+/// An admitted decoder owner. Retention runs before the native projection,
+/// so independently admitted conversion buffers need not be charged twice.
+pub trait ParquetBatchMemory: Debug + Send + Sync {
+    fn retain(
+        &self,
+        batch: arrow::array::RecordBatch,
+    ) -> datafusion_common::Result<arrow::array::RecordBatch>;
 }
 
 /// Default implementation of [`ParquetFileReaderFactory`]

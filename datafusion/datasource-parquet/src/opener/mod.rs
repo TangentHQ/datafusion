@@ -1546,6 +1546,11 @@ impl RowGroupsPrunedParquetOpen {
             .clone();
 
         let stream = PushDecoderStreamState {
+            factory: Arc::clone(&prepared.parquet_file_reader_factory),
+            metadata: Arc::clone(&file_metadata),
+            batch_size: prepared.batch_size,
+            memory: None,
+            admitted: false,
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,

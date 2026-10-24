@@ -247,6 +247,11 @@ impl RowGroupPruner {
 /// [`ParquetPushDecoder`], and yields projected [`RecordBatch`]es until the file is
 /// fully consumed.
 pub(crate) struct PushDecoderStreamState {
+    pub(crate) factory: Arc<dyn crate::ParquetFileReaderFactory>,
+    pub(crate) metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+    pub(crate) batch_size: usize,
+    pub(crate) memory: Option<Arc<dyn crate::ParquetBatchMemory>>,
+    pub(crate) admitted: bool,
     pub(crate) decoder: Option<ParquetPushDecoder>,
     pub(crate) active_reader: Option<ParquetRecordBatchReader>,
     pub(crate) rg_plan: VecDeque<RgPlanEntry>,
@@ -306,7 +311,11 @@ impl PushDecoderStreamState {
                     Some(Ok(batch)) => {
                         let mut timer = self.baseline_metrics.elapsed_compute().timer();
                         self.copy_arrow_reader_metrics();
-                        let result = self.project_batch(&batch);
+                        let result = match &self.memory {
+                            Some(memory) => memory.retain(batch),
+                            None => Ok(batch),
+                        }
+                        .and_then(|batch| self.project_batch(&batch));
                         timer.stop();
                         drop(timer);
                         return Some((result, self));
@@ -318,6 +327,8 @@ impl PushDecoderStreamState {
                         // Reader exhausted: drop and fall through to per-RG
                         // boundary handling, then try_next_reader.
                         self.active_reader = None;
+                        self.memory = None;
+                        self.admitted = false;
                     }
                 }
             }
@@ -387,6 +398,23 @@ impl PushDecoderStreamState {
                             return Some((Err(DataFusionError::from(e)), self));
                         }
                     }
+                }
+            }
+
+            // Admission precedes predicate evaluation as well as output
+            // decoding. A reservation spans all NeedsData transitions.
+            if !self.admitted {
+                let groups: Vec<_> =
+                    self.rg_plan.iter().map(|entry| entry.rg_index).collect();
+                match self
+                    .factory
+                    .reserve(&self.metadata, &groups, self.batch_size)
+                {
+                    Ok(memory) => {
+                        self.memory = memory;
+                        self.admitted = true;
+                    }
+                    Err(error) => return Some((Err(error), self)),
                 }
             }
 
