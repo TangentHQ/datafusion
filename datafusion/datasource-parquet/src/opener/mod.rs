@@ -1436,7 +1436,7 @@ impl RowGroupsPrunedParquetOpen {
         )?;
 
         let mut decode_projection = decoder_projection.projection_mask().clone();
-        let (decoder, rg_plan, has_row_selection) = {
+        let (decoder, rg_plan, has_row_selection, batch_size) = {
             let pushdown_predicate = prepared
                 .pushdown_filters
                 .then_some(prepared.predicate.as_ref())
@@ -1456,15 +1456,28 @@ impl RowGroupsPrunedParquetOpen {
             // actually read. We MUST build our `rg_plan` from this reordered
             // list, otherwise our per-RG pruner check would consult the
             // metadata of a different RG than the decoder is about to yield.
+            let prepared_access_plan = prepare_access_plan(access_plan)?;
+            // Native array readers use this value as their initial allocation
+            // capacity. A file of small row groups cannot fill a larger batch;
+            // avoid reserving that unused capacity for every column/reader.
+            let rows = prepared_access_plan
+                .row_group_indexes
+                .iter()
+                .map(|index| file_metadata.row_group(*index).num_rows())
+                .max()
+                .unwrap_or(1);
+            let rows = usize::try_from(rows).map_err(|_| {
+                DataFusionError::Execution("Invalid Parquet row-group length".into())
+            })?;
+            let batch_size = prepared.batch_size.min(rows.max(1));
             let decoder_config = DecoderBuilderConfig {
                 projection_mask: decoder_projection.projection_mask(),
-                batch_size: prepared.batch_size,
+                batch_size,
                 arrow_reader_metrics: &arrow_reader_metrics,
                 force_filter_selections: prepared.force_filter_selections,
                 decoder_limit: prepared.limit,
             };
 
-            let prepared_access_plan = prepare_access_plan(access_plan)?;
             // #24355: a row selection (from page-index pruning, or an externally
             // supplied `ParquetRowSelection`) is carried by the decoder as one
             // flat selection over the concatenation of the remaining row groups.
@@ -1498,7 +1511,7 @@ impl RowGroupsPrunedParquetOpen {
                 }
             }
 
-            (builder.build()?, rg_plan, has_row_selection)
+            (builder.build()?, rg_plan, has_row_selection, batch_size)
         };
 
         let predicate_cache_inner_records =
@@ -1555,7 +1568,7 @@ impl RowGroupsPrunedParquetOpen {
             decode_projection,
             decode_schema: Arc::clone(&prepared.physical_file_schema),
             decode_expressions: prepared.projection.clone(),
-            batch_size: prepared.batch_size,
+            batch_size,
             memory: None,
             admitted: false,
             decoder: Some(decoder),
