@@ -826,9 +826,10 @@ impl ExecutionPlan for FilterExec {
         &self,
         order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        // Filtering preserves relative row order. Leave projected filters to
-        // the existing projection optimizer rather than guessing index maps.
-        if self.projection.is_some() {
+        // Filtering preserves relative row order. A fetch selects a prefix and
+        // must fence reordering. Leave projected filters to the existing
+        // projection optimizer rather than guessing index maps.
+        if self.projection.is_some() || self.fetch.is_some() {
             return Ok(SortOrderPushdownResult::Unsupported);
         }
         self.input.try_pushdown_sort(order)?.try_map(|input| {
