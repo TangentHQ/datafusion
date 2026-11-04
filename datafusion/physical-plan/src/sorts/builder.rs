@@ -62,10 +62,6 @@ pub struct BatchBuilder {
     /// anti-starvation guarantee throughout the merge.
     initial_reservation: usize,
 
-    /// Bytes of the last output batch, charged until the next build so an
-    /// output batch is never resident without a reservation covering it.
-    emitted: usize,
-
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
 
@@ -91,7 +87,6 @@ impl BatchBuilder {
             reservation,
             batches_mem_used: 0,
             initial_reservation,
-            emitted: 0,
         }
     }
 
@@ -193,22 +188,16 @@ impl BatchBuilder {
             });
         }
 
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
-        // The output is resident until its consumer charges it; keep it
-        // charged until the next build replaces it with that build's estimate.
-        self.emitted = fresh(&batch)?;
-
         // Release excess memory back to the pool, but never shrink below
         // initial_reservation to maintain the anti-starvation guarantee
-        // for the merge phase.
-        let target = (self.batches_mem_used + self.emitted).max(self.initial_reservation);
+        // for the merge phase. The output's admission ends here: its
+        // consumer charges it on receipt, as it does any input batch.
+        let target = self.batches_mem_used.max(self.initial_reservation);
         if self.reservation.size() > target {
             self.reservation.shrink(self.reservation.size() - target);
-        } else {
-            try_grow_reservation_to_at_least(&mut self.reservation, target)?;
         }
 
-        Ok(batch)
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(Into::into)
     }
 
     /// Drains the in_progress row indexes, and builds a new RecordBatch from them
@@ -224,8 +213,8 @@ impl BatchBuilder {
         }
 
         // Interleaving allocates the output before any consumer can charge
-        // it. Admit it first, from the per-row bytes of each source batch;
-        // the previous output's charge is replaced rather than released.
+        // it. Admit it first, from the per-row bytes of each source batch,
+        // so a pool that cannot hold it refuses instead of being exceeded.
         let estimate = self
             .indices
             .iter()
@@ -319,7 +308,7 @@ mod tests {
     use arrow::buffer::Buffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_execution::memory_pool::{
-        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
     };
 
     fn overflow_list_batch() -> RecordBatch {
@@ -395,10 +384,10 @@ mod tests {
         assert!(is_offset_overflow(&error));
     }
 
-    /// An output batch is resident before its consumer can charge it, so the
-    /// merge's reservation covers it alongside the inputs it still holds.
+    /// Interleaving allocates the output before its consumer can charge it,
+    /// so a pool without room for it refuses the build instead.
     #[test]
-    fn test_build_record_batch_charges_its_output() {
+    fn test_build_record_batch_admits_its_output_first() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int32,
@@ -411,26 +400,24 @@ mod tests {
             )
             .unwrap()
         };
-        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let (left, right) = (batch((0..1024).collect()), batch((0..1024).collect()));
+        let held =
+            get_record_batch_memory_size(&left) + get_record_batch_memory_size(&right);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(held + 1024));
         let reservation = MemoryConsumer::new("test").register(&pool);
         let mut builder = BatchBuilder::new(Arc::clone(&schema), 2, 1024, reservation);
-        builder.push_batch(0, batch((0..1024).collect())).unwrap();
-        builder.push_batch(1, batch((0..1024).collect())).unwrap();
-        let held = builder.batches_mem_used;
+        builder.push_batch(0, left).unwrap();
+        builder.push_batch(1, right).unwrap();
         for _ in 0..512 {
             builder.push_row(0);
             builder.push_row(1);
         }
 
-        let output = builder.build_record_batch().unwrap().unwrap();
+        let error = builder.build_record_batch().unwrap_err();
 
-        assert_eq!(output.num_rows(), 1024);
-        let bytes = fresh(&output).unwrap();
-        assert!(bytes > 0);
         assert!(
-            pool.reserved() >= held + bytes,
-            "reserved {} of {held} held and {bytes} emitted",
-            pool.reserved()
+            matches!(error, DataFusionError::ResourcesExhausted(_)),
+            "{error}"
         );
     }
 }
