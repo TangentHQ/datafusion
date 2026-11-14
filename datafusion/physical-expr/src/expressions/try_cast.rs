@@ -230,6 +230,11 @@ impl PhysicalExpr for TryCastExpr {
                 protobuf::PhysicalTryCastNode {
                     expr: Some(Box::new(ctx.encode_child(&self.expr)?)),
                     arrow_type: Some(self.cast_type().try_into()?),
+                    // Presence carries `explicit_target`, even for a default-shaped field.
+                    target_field: self
+                        .explicit_target
+                        .then(|| self.target_field.as_ref().try_into())
+                        .transpose()?,
                 },
             ))),
         }))
@@ -263,8 +268,19 @@ impl TryCastExpr {
             "arrow_type",
         )?;
         let cast_type: DataType = arrow_type.try_into()?;
-
-        Ok(Arc::new(TryCastExpr::new(expr, cast_type)))
+        let Some(target_field) = &try_cast.target_field else {
+            return Ok(Arc::new(TryCastExpr::new(expr, cast_type)));
+        };
+        let target_field: Field = target_field.try_into()?;
+        if target_field.data_type() != &cast_type {
+            return datafusion_common::internal_err!(
+                "TryCastExpr target_field type does not match arrow_type"
+            );
+        }
+        Ok(Arc::new(TryCastExpr::new_with_target_field(
+            expr,
+            Arc::new(target_field),
+        )))
     }
 }
 
@@ -972,6 +988,35 @@ mod proto_tests {
         PhysicalExprNode, PhysicalTryCastNode, physical_expr_node,
     };
 
+    /// An explicit target's metadata survives a round trip, and a type-only
+    /// cast stays type-only.
+    #[test]
+    fn proto_round_trip_preserves_explicit_target_field() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let target = Arc::new(
+            Field::new("target", DataType::Int32, true)
+                .with_metadata(HashMap::from([("k".to_string(), "v".to_string())])),
+        );
+        let explicit =
+            TryCastExpr::new_with_target_field(col("a", &schema).unwrap(), target);
+        for cast in [explicit, try_cast_fixture()] {
+            let encoder = StubEncoder::ok();
+            let node = cast
+                .try_to_proto(&PhysicalExprEncodeCtx::new(&encoder))
+                .unwrap()
+                .unwrap();
+            let decoder = StubDecoder::ok();
+            let decoded = TryCastExpr::try_from_proto(
+                &node,
+                &PhysicalExprDecodeCtx::new(&schema, &decoder),
+            )
+            .unwrap();
+            let decoded = decoded.downcast_ref::<TryCastExpr>().unwrap();
+            assert_eq!(decoded.cast_type(), cast.cast_type());
+            assert_eq!(decoded.target_metadata(), cast.target_metadata());
+        }
+    }
+
     fn try_cast_fixture() -> TryCastExpr {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
         TryCastExpr::new(col("a", &schema).unwrap(), DataType::Int32)
@@ -988,7 +1033,11 @@ mod proto_tests {
         PhysicalExprNode {
             expr_id: None,
             expr_type: Some(physical_expr_node::ExprType::TryCast(Box::new(
-                PhysicalTryCastNode { expr, arrow_type },
+                PhysicalTryCastNode {
+                    expr,
+                    arrow_type,
+                    target_field: None,
+                },
             ))),
         }
     }

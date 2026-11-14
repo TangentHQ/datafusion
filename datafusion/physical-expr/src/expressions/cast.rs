@@ -398,6 +398,11 @@ impl PhysicalExpr for CastExpr {
                 protobuf::PhysicalCastNode {
                     expr: Some(Box::new(ctx.encode_child(self.expr())?)),
                     arrow_type: Some(self.cast_type().try_into()?),
+                    // Presence carries `explicit_target`, even for a default-shaped field.
+                    target_field: self
+                        .explicit_target
+                        .then(|| self.target_field.as_ref().try_into())
+                        .transpose()?,
                 },
             ))),
         }))
@@ -436,8 +441,19 @@ impl CastExpr {
         let arrow_type = cast_expr.arrow_type.as_ref().ok_or_else(|| {
             internal_datafusion_err!("CastExpr is missing required field 'arrow_type'")
         })?;
-
-        Ok(Arc::new(CastExpr::new(expr, arrow_type.try_into()?, None)))
+        let cast_type: DataType = arrow_type.try_into()?;
+        let Some(target_field) = &cast_expr.target_field else {
+            return Ok(Arc::new(CastExpr::new(expr, cast_type, None)));
+        };
+        let target_field: Field = target_field.try_into()?;
+        if target_field.data_type() != &cast_type {
+            return internal_err!("CastExpr target_field type does not match arrow_type");
+        }
+        Ok(Arc::new(CastExpr::new_with_target_field(
+            expr,
+            Arc::new(target_field),
+            None,
+        )))
     }
 }
 
@@ -1522,9 +1538,65 @@ mod proto_tests {
         PhysicalExprNode {
             expr_id: None,
             expr_type: Some(physical_expr_node::ExprType::Cast(Box::new(
-                PhysicalCastNode { expr, arrow_type },
+                PhysicalCastNode {
+                    expr,
+                    arrow_type,
+                    target_field: None,
+                },
             ))),
         }
+    }
+
+    /// An explicit target's nullability and metadata survive a round trip,
+    /// and a type-only cast stays type-only.
+    #[test]
+    fn proto_round_trip_preserves_explicit_target_field() {
+        let schema = Schema::new(vec![Field::new("a", Int32, false)]);
+        let target = Arc::new(
+            Field::new("target", Int64, true)
+                .with_metadata(HashMap::from([("k".to_string(), "v".to_string())])),
+        );
+        let explicit = CastExpr::new_with_target_field(
+            col("a", &schema).unwrap(),
+            Arc::clone(&target),
+            None,
+        );
+        for cast in [explicit, proto_cast_fixture()] {
+            let encoder = StubEncoder::ok();
+            let node = cast
+                .try_to_proto(&PhysicalExprEncodeCtx::new(&encoder))
+                .unwrap()
+                .unwrap();
+            let decoder = StubDecoder::ok();
+            let decoded = CastExpr::try_from_proto(
+                &node,
+                &PhysicalExprDecodeCtx::new(&schema, &decoder),
+            )
+            .unwrap();
+            let decoded = decoded.downcast_ref::<CastExpr>().unwrap();
+            assert_eq!(decoded.cast_type(), cast.cast_type());
+            assert_eq!(decoded.target_nullable(), cast.target_nullable());
+            assert_eq!(decoded.target_metadata(), cast.target_metadata());
+        }
+    }
+
+    #[test]
+    fn try_from_proto_rejects_target_field_of_another_type() {
+        let mut node = proto_cast_node(
+            Some(Box::new(column_node("a"))),
+            Some(proto_int64_arrow_type()),
+        );
+        if let Some(physical_expr_node::ExprType::Cast(cast)) = &mut node.expr_type {
+            cast.target_field =
+                Some((&Field::new("target", Int32, true)).try_into().unwrap());
+        }
+        let schema = Schema::empty();
+        let decoder = StubDecoder::ok();
+        let err = CastExpr::try_from_proto(
+            &node,
+            &PhysicalExprDecodeCtx::new(&schema, &decoder),
+        );
+        assert!(err.is_err());
     }
 
     #[test]

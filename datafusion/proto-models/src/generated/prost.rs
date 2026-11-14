@@ -1833,6 +1833,10 @@ pub struct PhysicalTryCastNode {
     pub expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(message, optional, tag = "2")]
     pub arrow_type: ::core::option::Option<super::datafusion_common::ArrowType>,
+    /// Present only for an explicit target. Absent nodes retain the legacy
+    /// type-only behavior, inheriting metadata from the input expression.
+    #[prost(message, optional, tag = "3")]
+    pub target_field: ::core::option::Option<super::datafusion_common::Field>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalCastNode {
@@ -1840,6 +1844,10 @@ pub struct PhysicalCastNode {
     pub expr: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalExprNode>>,
     #[prost(message, optional, tag = "2")]
     pub arrow_type: ::core::option::Option<super::datafusion_common::ArrowType>,
+    /// Present only for an explicit target. Absent nodes retain the legacy
+    /// type-only behavior, inheriting metadata and nullability from the input.
+    #[prost(message, optional, tag = "3")]
+    pub target_field: ::core::option::Option<super::datafusion_common::Field>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalNegativeNode {
