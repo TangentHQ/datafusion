@@ -297,3 +297,9 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+# The patched crates resolve their DataFusion siblings from crates.io, so a
+# consumer patches only them; their own tests build against this branch's
+# protobuf models.
+[patch.crates-io]
+datafusion-proto-models = { path = "datafusion/proto-models" }
