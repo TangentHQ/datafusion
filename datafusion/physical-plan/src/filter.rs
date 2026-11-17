@@ -6,7 +6,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
 use itertools::Itertools;
@@ -725,6 +725,10 @@ impl ExecutionPlan for FilterExec {
         Ok(Box::pin(FilterExecStream {
             schema: self.schema(),
             predicate: Arc::clone(&self.predicate),
+            flush: context
+                .session_config()
+                .get_extension::<crate::repartition::FlushOnDemand>()
+                .is_some(),
             input: self.input.execute(partition, context)?,
             metrics,
             projection: self.projection.clone(),
@@ -1661,6 +1665,8 @@ struct FilterExecStream {
     projection: Option<ProjectionRef>,
     /// Batch coalescer to combine small batches
     batch_coalescer: LimitedBatchCoalescer,
+    /// Opt-in prompt output while the input is blocked on a transfer.
+    flush: bool,
 }
 
 /// The metrics for `FilterExec`
@@ -1738,7 +1744,17 @@ impl Stream for FilterExecStream {
             }
 
             // Attempt to pull the next batch from the input stream.
-            match ready!(self.input.poll_next_unpin(cx)) {
+            let next = match self.input.poll_next_unpin(cx) {
+                Poll::Ready(next) => next,
+                Poll::Pending => {
+                    if self.flush && !self.batch_coalescer.is_empty() {
+                        self.batch_coalescer.flush()?;
+                        continue;
+                    }
+                    return Poll::Pending;
+                }
+            };
+            match next {
                 None => {
                     self.batch_coalescer.finish()?;
                     // Release the input pipeline's resources.
