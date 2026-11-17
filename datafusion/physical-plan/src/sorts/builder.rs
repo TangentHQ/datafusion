@@ -8,7 +8,7 @@ use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, internal_datafusion_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 use log::warn;
 use std::sync::Arc;
@@ -37,7 +37,9 @@ pub struct BatchBuilder {
     schema: SchemaRef,
 
     /// Maintain a list of [`RecordBatch`] and their corresponding stream
-    batches: Vec<(usize, RecordBatch)>,
+    /// Maintain a list of [`RecordBatch`], their corresponding stream and the
+    /// bytes per row that interleaving one of their rows allocates
+    batches: Vec<(usize, RecordBatch, usize)>,
 
     /// Accounts for memory used by buffered batches.
     ///
@@ -93,8 +95,9 @@ impl BatchBuilder {
         // usage exceeds the current reservation (which may include
         // pre-reserved bytes from sort_spill_reservation_bytes).
         try_grow_reservation_to_at_least(&mut self.reservation, self.batches_mem_used)?;
+        let width = fresh(&batch)?.div_ceil(batch.num_rows().max(1));
         let batch_idx = self.batches.len();
-        self.batches.push((stream_idx, batch));
+        self.batches.push((stream_idx, batch, width));
         self.cursors[stream_idx] = BatchCursor {
             batch_idx,
             row_idx: 0,
@@ -107,7 +110,7 @@ impl BatchBuilder {
         debug_assert!(
             self.batches
                 .get(self.cursors[stream_idx].batch_idx)
-                .is_some_and(|(_, batch)| {
+                .is_some_and(|(_, batch, _)| {
                     self.cursors[stream_idx].row_idx < batch.num_rows()
                 }),
             "push_row on stream {stream_idx} with no live batch"
@@ -145,7 +148,7 @@ impl BatchBuilder {
                 arrays.extend(
                     self.batches
                         .iter()
-                        .map(|(_, batch)| batch.column(column_idx).as_ref()),
+                        .map(|(_, batch, _)| batch.column(column_idx).as_ref()),
                 );
                 // Arrow 58.1.0+ returns OffsetOverflowError directly from
                 // interleave, allowing retry_interleave to shrink the batch.
@@ -171,7 +174,8 @@ impl BatchBuilder {
 
         // Release excess memory back to the pool, but never shrink below
         // initial_reservation to maintain the anti-starvation guarantee
-        // for the merge phase.
+        // for the merge phase. The output's admission ends here: its
+        // consumer charges it on receipt, as it does any input batch.
         let target = self.batches_mem_used.max(self.initial_reservation);
         if self.reservation.size() > target {
             self.reservation.shrink(self.reservation.size() - target);
@@ -188,7 +192,7 @@ impl BatchBuilder {
         // We can therefore drop all but the last live cursor batch for each stream
         let mut batch_idx = 0;
         let mut retained = 0;
-        self.batches.retain(|(stream_idx, batch)| {
+        self.batches.retain(|(stream_idx, batch, _)| {
             let stream_cursor = &mut self.cursors[*stream_idx];
             let is_cursor_batch = stream_cursor.batch_idx == batch_idx;
             let retain = is_cursor_batch && stream_cursor.row_idx < batch.num_rows();
@@ -217,7 +221,7 @@ impl BatchBuilder {
             if self
                 .batches
                 .get(cursor.batch_idx)
-                .is_some_and(|(_, batch)| cursor.row_idx < batch.num_rows())
+                .is_some_and(|(_, batch, _)| cursor.row_idx < batch.num_rows())
             {
                 retain_batch[cursor.batch_idx] = true;
             }
@@ -226,7 +230,7 @@ impl BatchBuilder {
         let mut batch_idx = 0;
         let mut retained = 0;
         let mut remap = vec![usize::MAX; self.batches.len()];
-        self.batches.retain(|(_, batch)| {
+        self.batches.retain(|(_, batch, _)| {
             let retain = retain_batch[batch_idx];
             if retain {
                 remap[batch_idx] = retained;
@@ -261,6 +265,21 @@ impl BatchBuilder {
             return Ok(None);
         }
 
+        // Interleaving allocates the output before any consumer can charge
+        // it. Admit it first, from the per-row bytes of each source batch,
+        // so a pool that cannot hold it refuses instead of being exceeded.
+        let estimate = self
+            .indices
+            .iter()
+            .try_fold(0usize, |bytes, (batch_idx, _)| {
+                bytes.checked_add(self.batches[*batch_idx].2)
+            })
+            .ok_or_else(|| internal_datafusion_err!("merge output size overflow"))?;
+        try_grow_reservation_to_at_least(
+            &mut self.reservation,
+            self.batches_mem_used.saturating_add(estimate),
+        )?;
+
         let (rows_to_emit, columns) =
             retry_interleave(self.indices.len(), self.indices.len(), |rows_to_emit| {
                 self.try_interleave_columns(&self.indices[..rows_to_emit])
@@ -268,6 +287,15 @@ impl BatchBuilder {
 
         Ok(Some(self.finish_record_batch(rows_to_emit, columns)?))
     }
+}
+
+/// Bytes a batch's rows occupy in freshly allocated buffers. Interleaving
+/// copies offsets, values and child arrays, but shares view data buffers,
+/// whose slice size counts only the views.
+fn fresh(batch: &RecordBatch) -> Result<usize> {
+    batch.columns().iter().try_fold(0usize, |bytes, array| {
+        Ok(bytes + array.to_data().get_slice_memory_size()?)
+    })
 }
 
 /// Try to grow `reservation` so it covers at least `needed` bytes.
@@ -334,7 +362,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_execution::memory_pool::{
-        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
     };
 
     fn overflow_list_batch() -> RecordBatch {
@@ -498,5 +526,42 @@ mod tests {
             .unwrap_err();
 
         assert!(is_offset_overflow(&error));
+    }
+
+    /// Interleaving allocates the output before its consumer can charge it,
+    /// so a pool without room for it refuses the build instead.
+    #[test]
+    fn test_build_record_batch_admits_its_output_first() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = |values: Vec<i32>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(values))],
+            )
+            .unwrap()
+        };
+        let (left, right) = (batch((0..1024).collect()), batch((0..1024).collect()));
+        let held =
+            get_record_batch_memory_size(&left) + get_record_batch_memory_size(&right);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(held + 1024));
+        let reservation = MemoryConsumer::new("test").register(&pool);
+        let mut builder = BatchBuilder::new(Arc::clone(&schema), 2, 1024, reservation);
+        builder.push_batch(0, left).unwrap();
+        builder.push_batch(1, right).unwrap();
+        for _ in 0..512 {
+            builder.push_row(0);
+            builder.push_row(1);
+        }
+
+        let error = builder.build_record_batch().unwrap_err();
+
+        assert!(
+            matches!(error, DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
     }
 }
