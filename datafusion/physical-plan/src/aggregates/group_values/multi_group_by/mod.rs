@@ -1285,7 +1285,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::{
-        Array, ArrayRef, DurationMicrosecondArray, FixedSizeBinaryArray, Float16Array,
+        Array, ArrayRef, AsArray, DurationMicrosecondArray, FixedSizeBinaryArray,
+        Float16Array,
         Int32Array, Int64Array, PrimitiveArray, RecordBatch, StringArray,
         StringViewArray, UInt32Array,
     };
