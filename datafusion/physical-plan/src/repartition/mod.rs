@@ -148,8 +148,8 @@ use distributor_channels::{
 ///
 /// A repartition that waits for memory ([`RepartitionExec::with_memory_wait`])
 /// holds its in-memory batches as [`RepartitionBatch::Queued`] instead, and when
-/// `try_grow()` fails for a batch of input data it first waits for a consumer
-/// to drain its queue (see [`MemoryWait::reserve`]).
+/// `try_grow()` fails for a batch of input data it first waits for the
+/// output's consumer to drain the output's queue (see [`MemoryWait::reserve`]).
 ///
 /// See [`RepartitionExec`] for overall architecture and [`StreamState`] for
 /// the state machine that handles reading these batches.
@@ -158,8 +158,8 @@ enum RepartitionBatch {
     /// Batch held in memory (counts against memory reservation)
     Memory(RecordBatch),
     /// Batch held in memory by a repartition that waits for memory. Its bytes
-    /// count against the memory reservation and the repartition's queued bytes
-    /// until a consumer takes it or a closed channel drops it.
+    /// count against the output's memory reservation until a consumer takes
+    /// it or a closed channel drops it.
     Queued(RecordBatch, QueuedBytes),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
@@ -172,22 +172,27 @@ enum RepartitionBatch {
 /// ([`RepartitionExec::with_memory_wait`]).
 #[derive(Debug, Default)]
 struct MemoryWait {
-    /// Bytes of the in-memory batches queued in this repartition's channels,
-    /// across all outputs, that no consumer has taken yet.
-    queued: AtomicUsize,
-    /// Notified whenever queued bytes go back to the pool.
+    /// Notified whenever a queued batch's bytes go back to the pool, on any
+    /// output; a woken producer retries and waits again if its own output has
+    /// not drained.
     drained: Notify,
 }
 
 impl MemoryWait {
-    /// Reserves `size` bytes in `reservation` for a batch, waiting while the
-    /// pool is full and this repartition's queue holds batches that its
-    /// consumers will drain.
+    /// Reserves `size` bytes in `reservation`, the reservation of the output a
+    /// batch is sent to, waiting while the pool refuses them and that output's
+    /// own queue holds batches its consumer will drain.
     ///
-    /// Returns `None` when the pool is full and nothing is queued: the memory
-    /// is held elsewhere, for example by an operator below this repartition
-    /// that feeds it, and waiting could deadlock on memory the queue cannot
-    /// free. The caller spills instead.
+    /// Only that output's drain is sure to make room: each output has its own
+    /// reservation, and a pool that caps each spilling consumer at a share of
+    /// the pool refuses the output until its own reservation shrinks, however
+    /// much the other outputs drain.
+    ///
+    /// Returns `None` when the pool refuses the bytes and the output's queue
+    /// is empty. Either the batch exceeds the output's share, or the memory is
+    /// held elsewhere (for example by an operator below this repartition that
+    /// feeds it), and waiting could deadlock on memory the queue cannot free.
+    /// The caller spills instead.
     async fn reserve(
         self: &Arc<Self>,
         reservation: &SharedMemoryReservation,
@@ -198,10 +203,14 @@ impl MemoryWait {
             // the check and the wait still wakes this task.
             let mut drained = pin!(self.drained.notified());
             drained.as_mut().enable();
-            if let Some(queued) = self.try_reserve(reservation, size) {
-                return Some(queued);
+            // The reservation holds exactly this output's queued batches. Read
+            // it before trying: a drain between the read and the try then
+            // shows up as room, not as an empty queue to spill on.
+            let queued = reservation.size();
+            if let Some(bytes) = self.try_reserve(reservation, size) {
+                return Some(bytes);
             }
-            if self.queued.load(AtomicOrdering::Acquire) == 0 {
+            if queued == 0 {
                 return None;
             }
             drained.await;
@@ -215,7 +224,6 @@ impl MemoryWait {
         size: usize,
     ) -> Option<QueuedBytes> {
         reservation.try_grow(size).ok()?;
-        self.queued.fetch_add(size, AtomicOrdering::AcqRel);
         Some(QueuedBytes {
             size,
             reservation: Arc::clone(reservation),
@@ -227,12 +235,13 @@ impl MemoryWait {
 /// The bytes one in-memory batch holds while it is queued in a repartition
 /// that waits for memory.
 ///
-/// Dropping it returns the bytes to the pool and wakes the producers waiting
-/// for memory. That happens wherever the batch leaves the queue: a consumer
-/// takes it, a send fails because the receiver is gone, or a dropped receiver
-/// (a cancelled consumer, a satisfied `LIMIT`) or an aborted send discards it.
-/// The accounting is therefore exact, and a waiting producer is never left
-/// waiting on bytes nobody will drain.
+/// Dropping it shrinks its output's reservation, returning the bytes to the
+/// pool, and wakes the producers waiting for memory. That happens wherever
+/// the batch leaves the queue: a consumer takes it, a send fails because the
+/// receiver is gone, or a dropped receiver (a cancelled consumer, a satisfied
+/// `LIMIT`) or an aborted send discards it. An output's reservation therefore
+/// holds exactly the batches queued for it, and a waiting producer is never
+/// left waiting on bytes nobody will drain.
 #[derive(Debug)]
 struct QueuedBytes {
     size: usize,
@@ -244,9 +253,6 @@ impl Drop for QueuedBytes {
     fn drop(&mut self) {
         // Return the memory before the producers wake, so they find the room
         self.reservation.shrink(self.size);
-        self.wait
-            .queued
-            .fetch_sub(self.size, AtomicOrdering::AcqRel);
         self.wait.drained.notify_waiters();
     }
 }
@@ -327,10 +333,10 @@ impl OutputChannel {
     /// from `self.inner` if the receiver has hung up.
     ///
     /// When `wait` is set and the repartition waits for memory
-    /// ([`RepartitionExec::with_memory_wait`]), a full pool makes this wait
-    /// for consumers to drain the repartition's queue instead of spilling (see
-    /// [`MemoryWait::reserve`]). Residual flushes and finalization pass
-    /// `false`: they reserve or spill as before.
+    /// ([`RepartitionExec::with_memory_wait`]), a refused reservation makes
+    /// this wait for the output's consumer to drain the output's queue instead
+    /// of spilling (see [`MemoryWait::reserve`]). Residual flushes and
+    /// finalization pass `false`: they reserve or spill as before.
     ///
     /// Used after [`OutputChannel::coalesce`] for performance purposes.
     async fn send(
@@ -2453,23 +2459,27 @@ impl RepartitionExec {
         Ok(self)
     }
 
-    /// Make an input task wait for consumers to drain this repartition's queue
-    /// when the memory pool is full, instead of spilling the batch it sends.
+    /// Make an input task wait for the consumer of the output it sends to,
+    /// when the memory pool refuses a batch, instead of spilling the batch.
     ///
     /// By default, an input task that cannot reserve memory for a batch writes
     /// it to the output's spill file. The gate in front of the outputs lets a
     /// sender through while any output is empty, so the input runs at its
     /// fastest consumer's pace, and what a slower consumer leaves behind first
-    /// fills memory and then spills without limit. With this set, the input
-    /// task waits until a consumer takes a queued batch and then retries, so
-    /// the input runs at the pace its consumers drain:
+    /// fills memory and then spills without limit. With this set, an input
+    /// task whose batch is refused waits until that output's consumer takes a
+    /// batch from the output's queue and then retries, so the input runs at
+    /// the pace its consumers drain:
     ///
     /// - Memory stays within the pool.
-    /// - Nothing spills while this repartition's own queue can free room. When
-    ///   the pool is full and the repartition holds no queued batches, the
-    ///   memory is held elsewhere (for example by an operator below this one
-    ///   that feeds it), so the batch spills as before rather than wait for
-    ///   memory this repartition cannot free.
+    /// - Nothing spills while the output's own queue can free room. Each
+    ///   output has its own reservation, and a pool that caps each spilling
+    ///   consumer at a share of the pool makes room for an output only when
+    ///   that output drains. When the output's queue is empty and the pool
+    ///   still refuses the batch, either the batch exceeds the output's share
+    ///   or the memory is held elsewhere (for example by an operator below
+    ///   this one that feeds it), so the batch spills as before rather than
+    ///   wait for memory this output cannot free.
     ///
     /// Residual batches (flushed on demand or when an input ends), end-of-input
     /// signals and errors never wait.
@@ -2477,9 +2487,9 @@ impl RepartitionExec {
     /// # Invariant
     ///
     /// Every output partition must be executed and read, or dropped,
-    /// independently of the others. Otherwise an input task can wait on memory
-    /// that only an unread output holds, while the reader that would drain it
-    /// waits on another output for data the waiting input task would send.
+    /// independently of the others. Otherwise an input task can wait on an
+    /// output nobody reads yet, while the reader that would drain it waits on
+    /// another output for data the waiting input task would send.
     /// That is why this is opt-in: the gate exists for consumers that read
     /// outputs one after another
     /// (<https://github.com/apache/datafusion/issues/22090>), and a default
