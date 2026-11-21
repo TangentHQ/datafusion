@@ -7,7 +7,7 @@
 //! maintaining the order of the input rows in the output.
 
 use std::fmt::{Debug, Display, Formatter};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll};
@@ -146,17 +146,109 @@ use distributor_channels::{
 ///               (FIFO order preserved)
 /// ```
 ///
+/// A repartition that waits for memory ([`RepartitionExec::with_memory_wait`])
+/// holds its in-memory batches as [`RepartitionBatch::Queued`] instead, and when
+/// `try_grow()` fails for a batch of input data it first waits for a consumer
+/// to drain its queue (see [`MemoryWait::reserve`]).
+///
 /// See [`RepartitionExec`] for overall architecture and [`StreamState`] for
 /// the state machine that handles reading these batches.
 #[derive(Debug)]
 enum RepartitionBatch {
     /// Batch held in memory (counts against memory reservation)
     Memory(RecordBatch),
+    /// Batch held in memory by a repartition that waits for memory. Its bytes
+    /// count against the memory reservation and the repartition's queued bytes
+    /// until a consumer takes it or a closed channel drops it.
+    Queued(RecordBatch, QueuedBytes),
     /// Marker indicating a batch was spilled to the partition's SpillPool.
     /// The actual batch can be retrieved by reading from the SpillPoolStream.
     /// This variant contains no data itself - it's just a signal to the reader
     /// to fetch the next batch from the spill stream.
     Spilled,
+}
+
+/// Shared by every output of a repartition that waits for memory
+/// ([`RepartitionExec::with_memory_wait`]).
+#[derive(Debug, Default)]
+struct MemoryWait {
+    /// Bytes of the in-memory batches queued in this repartition's channels,
+    /// across all outputs, that no consumer has taken yet.
+    queued: AtomicUsize,
+    /// Notified whenever queued bytes go back to the pool.
+    drained: Notify,
+}
+
+impl MemoryWait {
+    /// Reserves `size` bytes in `reservation` for a batch, waiting while the
+    /// pool is full and this repartition's queue holds batches that its
+    /// consumers will drain.
+    ///
+    /// Returns `None` when the pool is full and nothing is queued: the memory
+    /// is held elsewhere, for example by an operator below this repartition
+    /// that feeds it, and waiting could deadlock on memory the queue cannot
+    /// free. The caller spills instead.
+    async fn reserve(
+        self: &Arc<Self>,
+        reservation: &SharedMemoryReservation,
+        size: usize,
+    ) -> Option<QueuedBytes> {
+        loop {
+            // Register for the next drain before checking, so a drain between
+            // the check and the wait still wakes this task.
+            let mut drained = pin!(self.drained.notified());
+            drained.as_mut().enable();
+            if let Some(queued) = self.try_reserve(reservation, size) {
+                return Some(queued);
+            }
+            if self.queued.load(AtomicOrdering::Acquire) == 0 {
+                return None;
+            }
+            drained.await;
+        }
+    }
+
+    /// Reserves `size` bytes in `reservation` for a batch if the pool has room.
+    fn try_reserve(
+        self: &Arc<Self>,
+        reservation: &SharedMemoryReservation,
+        size: usize,
+    ) -> Option<QueuedBytes> {
+        reservation.try_grow(size).ok()?;
+        self.queued.fetch_add(size, AtomicOrdering::AcqRel);
+        Some(QueuedBytes {
+            size,
+            reservation: Arc::clone(reservation),
+            wait: Arc::clone(self),
+        })
+    }
+}
+
+/// The bytes one in-memory batch holds while it is queued in a repartition
+/// that waits for memory.
+///
+/// Dropping it returns the bytes to the pool and wakes the producers waiting
+/// for memory. That happens wherever the batch leaves the queue: a consumer
+/// takes it, a send fails because the receiver is gone, or a dropped receiver
+/// (a cancelled consumer, a satisfied `LIMIT`) or an aborted send discards it.
+/// The accounting is therefore exact, and a waiting producer is never left
+/// waiting on bytes nobody will drain.
+#[derive(Debug)]
+struct QueuedBytes {
+    size: usize,
+    reservation: SharedMemoryReservation,
+    wait: Arc<MemoryWait>,
+}
+
+impl Drop for QueuedBytes {
+    fn drop(&mut self) {
+        // Return the memory before the producers wake, so they find the room
+        self.reservation.shrink(self.size);
+        self.wait
+            .queued
+            .fetch_sub(self.size, AtomicOrdering::AcqRel);
+        self.wait.drained.notify_waiters();
+    }
 }
 
 type MaybeBatch = Option<Result<RepartitionBatch>>;
@@ -174,6 +266,9 @@ struct OutputChannel {
     reservation: SharedMemoryReservation,
     spill_writer: SpillPoolSink,
     shared_coalescer: Option<SharedCoalescer>,
+    /// Set when the repartition waits for memory instead of spilling
+    /// ([`RepartitionExec::with_memory_wait`]); shared by all its outputs.
+    memory_wait: Option<Arc<MemoryWait>>,
 }
 
 /// The set of spill-pool writers for a single output partition, before they are handed to the
@@ -212,7 +307,7 @@ impl OutputChannel {
             return Ok(());
         };
         for batch in shared.flush_requested()? {
-            let _ = self.send(batch).await;
+            let _ = self.send(batch, false).await;
         }
         Ok(())
     }
@@ -231,19 +326,41 @@ impl OutputChannel {
     /// the memory reservation / spill-writer fallback. Removes the channel
     /// from `self.inner` if the receiver has hung up.
     ///
+    /// When `wait` is set and the repartition waits for memory
+    /// ([`RepartitionExec::with_memory_wait`]), a full pool makes this wait
+    /// for consumers to drain the repartition's queue instead of spilling (see
+    /// [`MemoryWait::reserve`]). Residual flushes and finalization pass
+    /// `false`: they reserve or spill as before.
+    ///
     /// Used after [`OutputChannel::coalesce`] for performance purposes.
-    async fn send(&mut self, batch: RecordBatch) -> Result<(), SendError<MaybeBatch>> {
+    async fn send(
+        &mut self,
+        batch: RecordBatch,
+        wait: bool,
+    ) -> Result<(), SendError<MaybeBatch>> {
         let size = batch.get_array_memory_size();
 
+        // Waiting for memory holds no lock.
+        let queued = match &self.memory_wait {
+            Some(memory_wait) if wait => {
+                memory_wait.reserve(&self.reservation, size).await
+            }
+            Some(memory_wait) => memory_wait.try_reserve(&self.reservation, size),
+            None => None,
+        };
+
         // Decide the payload outside of any await: never hold a MutexGuard
-        // across an await point.
-        let (payload, is_memory_batch) = {
-            match self.reservation.try_grow(size) {
-                Ok(_) => (Ok(RepartitionBatch::Memory(batch)), true),
-                Err(_) => match self.spill_writer.push_batch(&batch) {
-                    Ok(()) => (Ok(RepartitionBatch::Spilled), false),
-                    Err(err) => (Err(err), false),
-                },
+        // across an await point. A repartition that waits for memory has
+        // already tried to reserve above, so here it only spills.
+        let (payload, is_memory_batch) = if let Some(queued) = queued {
+            // A queued batch returns its bytes itself when a failed send drops it
+            (Ok(RepartitionBatch::Queued(batch, queued)), false)
+        } else if self.memory_wait.is_none() && self.reservation.try_grow(size).is_ok() {
+            (Ok(RepartitionBatch::Memory(batch)), true)
+        } else {
+            match self.spill_writer.push_batch(&batch) {
+                Ok(()) => (Ok(RepartitionBatch::Spilled), false),
+                Err(err) => (Err(err), false),
             }
         };
 
@@ -261,7 +378,7 @@ impl OutputChannel {
         for batch in shared.finalize()? {
             // If this errored, it means that nobody is listening on the other side, which is fine
             // and can happen in certain cases, like when a LIMIT drops the stream that listens.
-            let _ = self.send(batch).await;
+            let _ = self.send(batch, false).await;
         }
         Ok(())
     }
@@ -477,6 +594,7 @@ impl RepartitionExecState {
         metrics: &ExecutionPlanMetricsSet,
         partitioning: &Partitioning,
         preserve_order: bool,
+        memory_wait: bool,
         name: &str,
         context: &Arc<TaskContext>,
         spill_manager: SpillManager,
@@ -510,6 +628,10 @@ impl RepartitionExecState {
             .session_config()
             .get_extension::<FlushOnDemand>()
             .map(|_| Arc::new(Notify::new()));
+        // An order-preserving repartition never waits: its consumer merges the
+        // inputs in order (see [`RepartitionExec::with_memory_wait`]).
+        let memory_wait =
+            (memory_wait && !preserve_order).then(|| Arc::new(MemoryWait::default()));
 
         let spill_manager = Arc::new(spill_manager);
 
@@ -640,6 +762,7 @@ impl RepartitionExecState {
                             reservation: Arc::clone(&channels.reservation),
                             spill_writer: channels.spill_writers.take_for_input(i)?,
                             shared_coalescer: channels.shared_coalescer.clone(),
+                            memory_wait: memory_wait.clone(),
                         },
                     ))
                 })
@@ -1587,6 +1710,9 @@ pub struct RepartitionExec {
     /// Optional override for the batch size used by the output coalescer.
     /// When `None`, falls back to `SessionConfig::batch_size`.
     batch_size: Option<usize>,
+    /// Whether producers wait for consumers to drain memory instead of
+    /// spilling. See [`Self::with_memory_wait`].
+    memory_wait: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1752,6 +1878,7 @@ impl ExecutionPlan for RepartitionExec {
                 if self.preserve_order {
                     repartition = repartition.with_preserve_order();
                 }
+                repartition.memory_wait = self.memory_wait;
                 Ok(Arc::new(repartition))
             }
         }
@@ -1802,6 +1929,7 @@ impl ExecutionPlan for RepartitionExec {
         let partitioning = self.partitioning().clone();
         let metrics = self.metrics.clone();
         let preserve_order = self.sort_exprs().is_some();
+        let memory_wait = self.memory_wait;
         let name = self.name().to_owned();
         let schema = self.schema();
         let schema_captured = Arc::clone(&schema);
@@ -1841,6 +1969,7 @@ impl ExecutionPlan for RepartitionExec {
                     &metrics,
                     &partitioning,
                     preserve_order,
+                    memory_wait,
                     &name,
                     &context,
                     spill_manager.clone(),
@@ -2057,10 +2186,10 @@ impl ExecutionPlan for RepartitionExec {
             others => others.clone(),
         };
 
-        Ok(Some(Arc::new(RepartitionExec::try_new(
-            new_projection,
-            new_partitioning,
-        )?)))
+        let mut new_repartition =
+            RepartitionExec::try_new(new_projection, new_partitioning)?;
+        new_repartition.memory_wait = self.memory_wait;
+        Ok(Some(Arc::new(new_repartition)))
     }
 
     fn gather_filters_for_pushdown(
@@ -2098,6 +2227,7 @@ impl ExecutionPlan for RepartitionExec {
             if self.preserve_order {
                 new_repartition = new_repartition.with_preserve_order();
             }
+            new_repartition.memory_wait = self.memory_wait;
             Ok(Arc::new(new_repartition) as Arc<dyn ExecutionPlan>)
         })
     }
@@ -2123,6 +2253,7 @@ impl ExecutionPlan for RepartitionExec {
                     repartition = repartition.with_preserve_order();
                 }
                 repartition.batch_size = self.batch_size;
+                repartition.memory_wait = self.memory_wait;
                 return Ok(Some(Arc::new(repartition)));
             }
             UnknownPartitioning(_) => UnknownPartitioning(target_partitions),
@@ -2134,6 +2265,7 @@ impl ExecutionPlan for RepartitionExec {
             preserve_order: self.preserve_order,
             cache: new_properties.into(),
             batch_size: self.batch_size,
+            memory_wait: self.memory_wait,
         })))
     }
 
@@ -2155,6 +2287,9 @@ impl ExecutionPlan for RepartitionExec {
             cache,
             // User-configurable output batch size, recomputed on decode from session config.
             batch_size: _,
+            // Opt-in wait for memory, set by the planner that knows every output
+            // has its own reader; not part of the wire format.
+            memory_wait: _,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -2237,6 +2372,7 @@ impl RepartitionExec {
             preserve_order,
             cache: Arc::new(cache),
             batch_size: None,
+            memory_wait: false,
         })
     }
 
@@ -2315,6 +2451,47 @@ impl RepartitionExec {
         }
         self.batch_size = Some(batch_size);
         Ok(self)
+    }
+
+    /// Make an input task wait for consumers to drain this repartition's queue
+    /// when the memory pool is full, instead of spilling the batch it sends.
+    ///
+    /// By default, an input task that cannot reserve memory for a batch writes
+    /// it to the output's spill file. The gate in front of the outputs lets a
+    /// sender through while any output is empty, so the input runs at its
+    /// fastest consumer's pace, and what a slower consumer leaves behind first
+    /// fills memory and then spills without limit. With this set, the input
+    /// task waits until a consumer takes a queued batch and then retries, so
+    /// the input runs at the pace its consumers drain:
+    ///
+    /// - Memory stays within the pool.
+    /// - Nothing spills while this repartition's own queue can free room. When
+    ///   the pool is full and the repartition holds no queued batches, the
+    ///   memory is held elsewhere (for example by an operator below this one
+    ///   that feeds it), so the batch spills as before rather than wait for
+    ///   memory this repartition cannot free.
+    ///
+    /// Residual batches (flushed on demand or when an input ends), end-of-input
+    /// signals and errors never wait.
+    ///
+    /// # Invariant
+    ///
+    /// Every output partition must be executed and read, or dropped,
+    /// independently of the others. Otherwise an input task can wait on memory
+    /// that only an unread output holds, while the reader that would drain it
+    /// waits on another output for data the waiting input task would send.
+    /// That is why this is opt-in: the gate exists for consumers that read
+    /// outputs one after another
+    /// (<https://github.com/apache/datafusion/issues/22090>), and a default
+    /// bound on the outputs (<https://github.com/apache/datafusion/pull/22092>)
+    /// was closed for that reason. Set it only from a planner that knows each
+    /// output has its own reader.
+    ///
+    /// Has no effect when the repartition preserves order (see
+    /// [`Self::with_preserve_order`]): its consumer merges the inputs in order.
+    pub fn with_memory_wait(mut self) -> Self {
+        self.memory_wait = true;
+        self
     }
 
     /// Return the sort expressions that are used to merge
@@ -2403,7 +2580,7 @@ impl RepartitionExec {
                 if let Some(output_channel) = output_channels.get_mut(&partition) {
                     output_channel.coalesce(batch, &mut coalesced)?;
                     for batch in coalesced.drain(..) {
-                        if output_channel.send(batch).await.is_err() {
+                        if output_channel.send(batch, true).await.is_err() {
                             // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
                             // so ignore this channel from now on.
                             output_channels.remove(&partition);
@@ -2634,6 +2811,12 @@ impl PerPartitionStream {
                             Ok(RepartitionBatch::Memory(batch)) => {
                                 // Release memory and return batch
                                 self.reservation.shrink(batch.get_array_memory_size());
+                                return Poll::Ready(Some(Ok(batch)));
+                            }
+                            Ok(RepartitionBatch::Queued(batch, queued)) => {
+                                // Release memory, wake the producers waiting
+                                // for it, and return batch
+                                drop(queued);
                                 return Poll::Ready(Some(Ok(batch)));
                             }
                             Ok(RepartitionBatch::Spilled) => {
