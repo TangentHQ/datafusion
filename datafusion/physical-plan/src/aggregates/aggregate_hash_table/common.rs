@@ -407,7 +407,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     pub(in crate::aggregates) fn take_state_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
-        self.take_state_batch_inner(false)
+        self.take_state_batch_inner(false, 0)
     }
 
     /// Like [`Self::take_state_batch`], but keeps the table's capacity for as
@@ -415,14 +415,7 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
     pub(in crate::aggregates) fn take_state_batch_keep_capacity(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
-        self.take_state_batch_inner(true)
-    }
-
-    fn take_state_batch_inner(
-        &mut self,
-        keep_capacity: bool,
-
-        self.take_state_batch_with_capacity(0)
+        self.take_state_batch_inner(true, 0)
     }
 
     /// Reserves fixed row capacity without changing the number of groups.
@@ -437,10 +430,17 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         }
     }
 
-    /// Emits all states and optionally reserves a fixed capacity for the next table.
-    /// A zero capacity uses the normal memory-releasing path.
+    /// Emits all states and reserves a fixed capacity for the next table.
     pub(in crate::aggregates) fn take_state_batch_with_capacity(
         &mut self,
+        capacity: usize,
+    ) -> Result<Option<RecordBatch>> {
+        self.take_state_batch_inner(false, capacity)
+    }
+
+    fn take_state_batch_inner(
+        &mut self,
+        keep_capacity: bool,
         capacity: usize,
     ) -> Result<Option<RecordBatch>> {
         let state_schema = Arc::clone(&self.state_schema);
@@ -474,24 +474,20 @@ impl<AggrMode> AggregateHashTable<AggrMode> {
         // key/index buffers and accumulator scratch too so the memory
         // reservation can be released before the batch is sorted for spilling,
         // unless the table is about to be refilled.
+        state.batch_group_indices.clear();
+        if capacity > 0 {
+            for acc in &mut state.accumulators {
+                acc.accumulator.reserve_groups(capacity);
+            }
+            return Ok(Some(batch));
+        }
         state
             .group_values
             .clear_shrink(if keep_capacity { batch.num_rows() } else { 0 });
-        state.batch_group_indices.clear();
         state.batch_group_indices.shrink_to_fit();
         if !keep_capacity {
             for acc in &mut state.accumulators {
                 acc.shrink_to_fit();
-
-        // key/index buffers too so the memory reservation can be released
-        // before the batch is sorted for spilling.
-        state.batch_group_indices.clear();
-        if capacity == 0 {
-            state.group_values.clear_shrink(0);
-            state.batch_group_indices.shrink_to_fit();
-        } else {
-            for acc in &mut state.accumulators {
-                acc.accumulator.reserve_groups(capacity);
             }
         }
 
